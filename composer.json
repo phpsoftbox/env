@@ -1,0 +1,54 @@
+{
+    "name": "phpsoftbox/env",
+    "description": "Environment variables loader for the PhpSoftBox framework",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Anton K.",
+            "email": "inspector-who@mail.ru"
+        }
+    ],
+    "config": {
+        "sort-packages": true
+    },
+    "require": {
+        "php": "^8.4",
+        "phpsoftbox/collection": "dev-master",
+        "psr/simple-cache": "^3.0"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.93",
+        "phpsoftbox/cache": "dev-master",
+        "phpsoftbox/cli-app": "dev-master",
+        "phpsoftbox/cs-fixer": "^1.0.1",
+        "phpunit/phpunit": "^11.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "PhpSoftBox\\Env\\": "src/"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PhpSoftBox\\Env\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "psb": {
+            "providers": [
+                "PhpSoftBox\\Env\\Cli\\EnvCommandProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "cs:fix": "vendor/bin/psb-cs-fixer fix",
+        "cs:check": "vendor/bin/psb-cs-fixer check --diff"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
