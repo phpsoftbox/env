@@ -4,59 +4,52 @@ declare(strict_types=1);
 
 namespace PhpSoftBox\Env;
 
-use function array_key_exists;
-use function is_array;
-
+/**
+ * Хранилище значений для env(): содержит только значения из .env-файлов.
+ *
+ * Переменные процесса ($_ENV, $_SERVER, getenv()) не копируются в хранилище, а читаются при каждом обращении.
+ * При $globalsFirst = true (режим load()/safeLoad() с globals) значение процесса перекрывает значение из файла,
+ * иначе значения из файлов приоритетнее, а переменные процесса используются как запасной вариант.
+ */
 final class EnvStorage
 {
     private static ?Variables $variables = null;
+    private static bool $globalsFirst    = false;
 
-    public static function set(Variables $variables): void
+    public static function set(Variables $variables, bool $globalsFirst = false): void
     {
-        self::$variables = $variables;
+        self::$variables    = $variables;
+        self::$globalsFirst = $globalsFirst;
     }
 
     public static function clear(): void
     {
-        self::$variables = null;
+        self::$variables    = null;
+        self::$globalsFirst = false;
     }
 
     public static function has(string $key): bool
     {
-        if (self::$variables !== null && self::$variables->has($key)) {
+        if (self::$variables?->resolveKey($key) !== null) {
             return true;
         }
 
-        $env = $GLOBALS['_ENV'] ?? null;
-        if (is_array($env) && array_key_exists($key, $env)) {
-            return true;
-        }
-
-        $server = $GLOBALS['_SERVER'] ?? null;
-        if (is_array($server) && array_key_exists($key, $server)) {
-            return true;
-        }
-
-        return false;
+        return EnvGlobals::has($key);
     }
 
     public static function get(string $key, mixed $default = null): mixed
     {
-        if (self::$variables !== null && self::$variables->has($key)) {
-            return self::$variables->get($key);
+        $storedKey = self::$variables?->resolveKey($key);
+
+        if ($storedKey !== null) {
+            if (self::$globalsFirst && EnvGlobals::has($storedKey)) {
+                return EnvGlobals::get($storedKey);
+            }
+
+            return self::$variables->get($storedKey);
         }
 
-        $env = $GLOBALS['_ENV'] ?? null;
-        if (is_array($env) && array_key_exists($key, $env)) {
-            return $env[$key];
-        }
-
-        $server = $GLOBALS['_SERVER'] ?? null;
-        if (is_array($server) && array_key_exists($key, $server)) {
-            return $server[$key];
-        }
-
-        return $default;
+        return EnvGlobals::get($key, $default);
     }
 
     public static function value(string $key, mixed $default = null): EnvValue
