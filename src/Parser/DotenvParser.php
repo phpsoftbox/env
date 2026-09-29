@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpSoftBox\Env\Parser;
 
 use InvalidArgumentException;
+use PhpSoftBox\Env\Exception\EnvException;
 
 use function count;
 use function explode;
@@ -12,12 +13,12 @@ use function file;
 use function filemtime;
 use function ltrim;
 use function preg_match;
-use function preg_replace_callback;
 use function rtrim;
+use function sprintf;
 use function str_contains;
-use function str_replace;
 use function str_starts_with;
 use function strlen;
+use function strpos;
 use function substr;
 use function trim;
 
@@ -65,7 +66,7 @@ final class DotenvParser implements ParserInterface
                 continue;
             }
 
-            $value = $this->parseValue($valuePart, $lines, $index, $context);
+            $value = $this->parseValue($valuePart, $lines, $index, $context, $path);
 
             $values[$name]     = $value;
             $exportable[$name] = $scope !== 'local';
@@ -79,7 +80,7 @@ final class DotenvParser implements ParserInterface
      * @param list<string> $lines
      * @param array<string, string> $context
      */
-    private function parseValue(string $valuePart, array $lines, int &$index, array $context): string
+    private function parseValue(string $valuePart, array $lines, int &$index, array $context, string $path): string
     {
         $value = ltrim($valuePart);
         if ($value === '') {
@@ -88,7 +89,7 @@ final class DotenvParser implements ParserInterface
 
         $first = $value[0];
         if ($first === '"' || $first === "'") {
-            return $this->parseQuotedValue($value, $first, $lines, $index, $context);
+            return $this->parseQuotedValue(substr($value, 1), $first, $lines, $index, $context, $path);
         }
 
         if ($this->looksLikeMultilineBlock($value)) {
@@ -102,37 +103,90 @@ final class DotenvParser implements ParserInterface
     }
 
     /**
+     * Однопроходный разбор значения в кавычках: escape-последовательности, интерполяция (только для двойных
+     * кавычек) и поиск закрывающей кавычки выполняются за один проход, поэтому `\\` перед кавычкой не экранирует её.
+     * Значение может продолжаться на следующих строках до закрывающей кавычки; текст после неё игнорируется.
+     *
      * @param list<string> $lines
      * @param array<string, string> $context
+     *
+     * @throws EnvException Если закрывающая кавычка не найдена до конца файла.
      */
-    private function parseQuotedValue(string $value, string $quote, array $lines, int &$index, array $context): string
-    {
-        $value  = substr($value, 1);
-        $buffer = '';
+    private function parseQuotedValue(
+        string $value,
+        string $quote,
+        array $lines,
+        int &$index,
+        array $context,
+        string $path,
+    ): string {
+        $startLine = $index + 1;
+        $lineCount = count($lines);
+        $double    = $quote === '"';
+        $buffer    = '';
 
         while (true) {
-            $pos = $this->findClosingQuote($value, $quote);
-            if ($pos !== null) {
-                $buffer .= substr($value, 0, $pos);
-                break;
+            $length = strlen($value);
+            for ($i = 0; $i < $length; $i++) {
+                $char = $value[$i];
+
+                if ($char === $quote) {
+                    return $buffer;
+                }
+
+                if ($char === '\\' && $i + 1 < $length) {
+                    $buffer .= $this->unescape($value[$i + 1], $double);
+                    $i++;
+                    continue;
+                }
+
+                if ($double && $char === '$') {
+                    $reference = $this->resolveReference($value, $i, $context, $quote);
+                    if ($reference !== null) {
+                        [$replacement, $i] = $reference;
+                        $buffer .= $replacement;
+                        continue;
+                    }
+                }
+
+                $buffer .= $char;
             }
 
-            $buffer .= $value;
             $index++;
-            if (!isset($lines[$index])) {
-                break;
+            if ($index >= $lineCount) {
+                throw new EnvException(sprintf(
+                    'Unclosed %s quote in env file %s on line %d.',
+                    $double ? 'double' : 'single',
+                    $path,
+                    $startLine,
+                ));
             }
+
             $buffer .= "\n";
             $value = $lines[$index];
         }
+    }
 
-        if ($quote === '"') {
-            $buffer = $this->unescapeDoubleQuoted($buffer);
-
-            return $this->interpolate($buffer, $context);
+    /**
+     * Escape-последовательности: в двойных кавычках — `\\`, `\"`, `\n`, `\r`, `\t`, `\$`;
+     * в одинарных — `\\` и `\'`. Неизвестная последовательность сохраняется как есть (с обратным слешем).
+     */
+    private function unescape(string $char, bool $double): string
+    {
+        if ($double) {
+            return match ($char) {
+                'n'            => "\n",
+                'r'            => "\r",
+                't'            => "\t",
+                '"', '\\', '$' => $char,
+                default        => '\\' . $char,
+            };
         }
 
-        return $this->unescapeSingleQuoted($buffer);
+        return match ($char) {
+            "'", '\\' => $char,
+            default   => '\\' . $char,
+        };
     }
 
     private function stripInlineComment(string $value): string
@@ -147,63 +201,87 @@ final class DotenvParser implements ParserInterface
         return rtrim($value);
     }
 
+    /**
+     * Интерполяция значения без кавычек: `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:+alt}`;
+     * `\$` даёт литерал `$`, остальные обратные слеши сохраняются.
+     *
+     * @param array<string, string> $context
+     */
     private function interpolate(string $value, array $context): string
     {
-        $result = preg_replace_callback(
-            '/(?<!\\\\)\$(\{[^}]+\}|[A-Za-z0-9_]+)/',
-            static function (array $matches) use ($context): string {
-                $token = $matches[1];
-                if ($token[0] === '{') {
-                    $expr = substr($token, 1, -1);
+        $result = '';
+        $length = strlen($value);
 
-                    if (preg_match('/^([A-Za-z0-9_]+)(:-|:\+)(.*)$/s', $expr, $parts)) {
-                        $name     = $parts[1];
-                        $operator = $parts[2];
-                        $fallback = $parts[3];
-                        $current  = $context[$name] ?? '';
+        for ($i = 0; $i < $length; $i++) {
+            $char = $value[$i];
 
-                        if ($operator === ':-') {
-                            return $current === '' ? $fallback : $current;
-                        }
+            if ($char === '\\' && ($value[$i + 1] ?? '') === '$') {
+                $result .= '$';
+                $i++;
+                continue;
+            }
 
-                        return $current === '' ? '' : $fallback;
-                    }
-
-                    return $context[$expr] ?? '';
+            if ($char === '$') {
+                $reference = $this->resolveReference($value, $i, $context);
+                if ($reference !== null) {
+                    [$replacement, $i] = $reference;
+                    $result .= $replacement;
+                    continue;
                 }
+            }
 
-                return $context[$token] ?? '';
-            },
-            $value,
-        );
-
-        if ($result === null) {
-            throw new InvalidArgumentException('Failed to interpolate env value.');
+            $result .= $char;
         }
 
-        return str_replace('\\$', '$', $result);
+        return $result;
     }
 
-    private function findClosingQuote(string $value, string $quote): ?int
+    /**
+     * Разбирает ссылку на переменную, начинающуюся с `$` в позиции $offset.
+     * Выражение `${...}` заканчивается на первой `}` (вложенные подстановки не поддерживаются).
+     *
+     * @param array<string, string> $context
+     * @return array{0: string, 1: int}|null Подстановка и индекс последнего символа ссылки; null — это не ссылка.
+     */
+    private function resolveReference(string $value, int $offset, array $context, ?string $quote = null): ?array
     {
-        $length = strlen($value);
-        for ($i = 0; $i < $length; $i++) {
-            if ($value[$i] === $quote && ($i === 0 || $value[$i - 1] !== '\\')) {
-                return $i;
+        if (($value[$offset + 1] ?? '') === '{') {
+            $end = strpos($value, '}', $offset + 2);
+            if ($end === false) {
+                return null;
             }
+
+            $expr = substr($value, $offset + 2, $end - $offset - 2);
+            if ($expr === '' || ($quote !== null && str_contains($expr, $quote))) {
+                return null;
+            }
+
+            return [$this->resolveExpression($expr, $context), $end];
+        }
+
+        if (preg_match('/[A-Za-z0-9_]+/A', $value, $matches, 0, $offset + 1) === 1) {
+            return [$context[$matches[0]] ?? '', $offset + strlen($matches[0])];
         }
 
         return null;
     }
 
-    private function unescapeDoubleQuoted(string $value): string
+    /**
+     * @param array<string, string> $context
+     */
+    private function resolveExpression(string $expr, array $context): string
     {
-        return str_replace(['\\n', '\\r', '\\t', '\\"', '\\\\'], ["\n", "\r", "\t", '"', '\\'], $value);
-    }
+        if (preg_match('/^([A-Za-z0-9_]+)(:-|:\+)(.*)$/s', $expr, $parts) === 1) {
+            $current = $context[$parts[1]] ?? '';
 
-    private function unescapeSingleQuoted(string $value): string
-    {
-        return str_replace(["\\'", '\\\\'], ["'", '\\'], $value);
+            if ($parts[2] === ':-') {
+                return $current === '' ? $parts[3] : $current;
+            }
+
+            return $current === '' ? '' : $parts[3];
+        }
+
+        return $context[$expr] ?? '';
     }
 
     /**
