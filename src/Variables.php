@@ -10,7 +10,6 @@ use PhpSoftBox\Collection\Collection;
 use function array_key_exists;
 use function ini_get;
 use function is_array;
-use function is_scalar;
 use function is_string;
 use function putenv;
 use function str_contains;
@@ -38,29 +37,12 @@ final class Variables
         return self::fromParsed($variables, [], $prefix, true);
     }
 
+    /**
+     * Переменные из $_ENV/$_SERVER. Префикс к ключам globals не применяется: он используется только при поиске.
+     */
     public static function fromGlobals(?string $prefix = null): self
     {
-        $data = [];
-
-        $env = $GLOBALS['_ENV'] ?? null;
-        if (is_array($env)) {
-            foreach ($env as $key => $value) {
-                if (is_string($key) && is_scalar($value)) {
-                    $data[$key] = (string) $value;
-                }
-            }
-        }
-
-        $server = $GLOBALS['_SERVER'] ?? null;
-        if (is_array($server)) {
-            foreach ($server as $key => $value) {
-                if (is_string($key) && is_scalar($value) && !array_key_exists($key, $data)) {
-                    $data[$key] = (string) $value;
-                }
-            }
-        }
-
-        return self::fromArray($data, $prefix);
+        return self::empty($prefix)->withGlobals(EnvGlobals::all());
     }
 
     public static function empty(?string $prefix = null): self
@@ -94,6 +76,39 @@ final class Variables
         }
 
         return new self(new Collection($normalized), $exportMap, $prefix);
+    }
+
+    /**
+     * Добавляет значения globals как есть (без префикса).
+     *
+     * @param array<string, string> $globals
+     * @param bool $overload true — значения из файлов приоритетнее globals, false — globals перекрывают файлы.
+     */
+    public function withGlobals(array $globals, bool $overload = false): self
+    {
+        $items      = $this->variables->all();
+        $exportable = $this->exportable;
+
+        foreach ($globals as $key => $value) {
+            if (!is_string($key) || ($overload && array_key_exists($key, $items))) {
+                continue;
+            }
+
+            $items[$key]      = (string) $value;
+            $exportable[$key] = $exportable[$key] ?? true;
+        }
+
+        return new self(new Collection($items), $exportable, $this->prefix);
+    }
+
+    /**
+     * Ключ, под которым значение хранится в наборе, или null, если ключа нет.
+     */
+    public function resolveKey(string $key): ?string
+    {
+        $normalized = $this->normalizeKey($key);
+
+        return $this->variables->has($normalized) ? $normalized : null;
     }
 
     public function get(string $key, mixed $default = null): mixed
@@ -227,18 +242,22 @@ final class Variables
         return $this->value($key)->array($default);
     }
 
+    /**
+     * С префиксом ключ ищется как `{prefix}{key}`, а если такого нет — как есть (например, PATH из globals).
+     */
     private function normalizeKey(string $key): string
     {
         $prefix = $this->prefix;
-        if ($prefix === null || $prefix === '') {
+        if ($prefix === null || $prefix === '' || str_starts_with($key, $prefix)) {
             return $key;
         }
 
-        if (str_starts_with($key, $prefix)) {
+        $prefixed = $prefix . $key;
+        if (!$this->variables->has($prefixed) && $this->variables->has($key)) {
             return $key;
         }
 
-        return $prefix . $key;
+        return $prefixed;
     }
 
     private function assertCompatiblePrefix(self $other): void

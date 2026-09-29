@@ -10,8 +10,6 @@ use PhpSoftBox\CliApp\Runner\RunnerInterface;
 use PhpSoftBox\Env\Environment;
 use Psr\SimpleCache\CacheInterface;
 
-use function is_string;
-
 final readonly class ClearEnvCacheHandler implements HandlerInterface
 {
     public function __construct(
@@ -27,12 +25,8 @@ final readonly class ClearEnvCacheHandler implements HandlerInterface
             return Response::FAILURE;
         }
 
-        $env = $runner->request()->option('environment');
-        if ($env === '') {
-            $env = null;
-        }
-
-        $key = Environment::cacheKeyForEnvironment(is_string($env) ? $env : null);
+        // Окружение приложения (или --environment): тот же ключ, под которым Environment сохранил кеш.
+        $key = Environment::cacheKeyForEnvironment($runner->environment());
 
         if ($this->cache->delete($key)) {
             $runner->io()->writeln('Кеш env очищен (' . $key . ').', 'success');

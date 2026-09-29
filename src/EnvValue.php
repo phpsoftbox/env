@@ -22,8 +22,9 @@ use function is_a;
 use function is_array;
 use function is_string;
 use function sprintf;
-use function str_contains;
+use function str_ends_with;
 use function str_starts_with;
+use function substr;
 
 final readonly class EnvValue
 {
@@ -80,6 +81,11 @@ final readonly class EnvValue
         return new BooleanFilter($default)($this->value);
     }
 
+    /**
+     * Массив из значения: JSON (`["a","b"]`, `{"k":"v"}`), список в скобках без кавычек (`[a,b]`)
+     * или список через запятую (`a, b`); одиночное значение (`a`) даёт список из одного элемента.
+     * Пустые элементы отбрасываются, некорректный JSON-объект (`{...}`) даёт $default.
+     */
     public function array(?array $default = null): ?array
     {
         if (is_array($this->value)) {
@@ -102,10 +108,12 @@ final readonly class EnvValue
             if (is_array($decoded)) {
                 return $decoded;
             }
-        }
 
-        if (!str_contains($value, ',')) {
-            return $default;
+            if (!str_starts_with($value, '[') || !str_ends_with($value, ']')) {
+                return $default;
+            }
+
+            $value = substr($value, 1, -1);
         }
 
         return new ListFilter(

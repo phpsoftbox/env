@@ -25,6 +25,7 @@ final class Environment
     private ?string $environment            = null;
     private bool $includeGlobals            = true;
     private ?string $prefix                 = null;
+    private bool $recursive                 = false;
     private ?CacheInterface $cache          = null;
     private int|DateInterval|null $cacheTtl = null;
     private ParserInterface $parser;
@@ -46,6 +47,9 @@ final class Environment
         $this->reader = new FileReader($this->paths, $this->parser);
     }
 
+    /**
+     * Загрузка из каталога: читаются только `.env` и `.env.{env}` этого каталога (без обхода подкаталогов).
+     */
     public static function create(string $directory): self
     {
         return new self([$directory]);
@@ -78,6 +82,10 @@ final class Environment
         return $this;
     }
 
+    /**
+     * Префикс добавляется только к ключам из env-файлов (DB_HOST → APP_DB_HOST); переменные процесса
+     * (PATH, HOME, ...) остаются без префикса. При поиске ключ проверяется с префиксом, затем как есть.
+     */
     public function setPrefix(?string $prefix): self
     {
         $this->prefix = $prefix;
@@ -93,10 +101,22 @@ final class Environment
         return $this;
     }
 
+    /**
+     * Включает обход подкаталогов (кроме скрытых, vendor и node_modules) в поисках `.env`/`.env.{env}`.
+     * Файлы вложенных каталогов перекрывают файлы корня. Сбрасывает ридер, заданный через setReader().
+     */
+    public function setRecursive(bool $recursive): self
+    {
+        $this->recursive = $recursive;
+        $this->reader    = new FileReader($this->paths, $this->parser, $this->recursive);
+
+        return $this;
+    }
+
     public function setParser(ParserInterface $parser): self
     {
         $this->parser = $parser;
-        $this->reader = new FileReader($this->paths, $this->parser);
+        $this->reader = new FileReader($this->paths, $this->parser, $this->recursive);
 
         return $this;
     }
@@ -147,49 +167,57 @@ final class Environment
         return self::CACHE_KEY_PREFIX . '.' . $env;
     }
 
+    /**
+     * В кеш попадают только значения из файлов; переменные процесса ($_ENV/$_SERVER) читаются заново
+     * при каждой загрузке и в хранилище env() не копируются.
+     */
     private function loadInternal(bool $overload, bool $strict): Variables
     {
-        if ($this->cache !== null) {
-            $cached    = $this->cache->get(self::cacheKeyForEnvironment($this->environment));
-            $variables = null;
+        $fileVariables = $this->loadFileVariables($strict);
 
-            if ($cached instanceof Variables) {
-                $variables = $cached;
-            } elseif (is_array($cached)) {
-                $variables = Variables::fromArray($cached, $this->prefix);
-            }
-
-            if ($variables !== null) {
-                foreach ($this->validators as $validator) {
-                    $validator->validate($variables);
-                }
-
-                EnvStorage::set($variables);
-
-                return $variables;
-            }
-        }
-
-        $variables = $this->reader->read(
-            environment: $this->environment,
-            includeGlobals: $this->includeGlobals,
-            overload: $overload,
-            prefix: $this->prefix,
-            strict: $strict,
-        );
+        $variables = $this->includeGlobals
+            ? $fileVariables->withGlobals(EnvGlobals::all(), $overload)
+            : $fileVariables;
 
         foreach ($this->validators as $validator) {
             $validator->validate($variables);
         }
 
-        EnvStorage::set($variables);
-
-        if ($this->cache !== null) {
-            $this->cache->set(self::cacheKeyForEnvironment($this->environment), $variables, $this->cacheTtl);
-        }
+        EnvStorage::set($fileVariables, globalsFirst: $this->includeGlobals && !$overload);
 
         return $variables;
     }
 
+    private function loadFileVariables(bool $strict): Variables
+    {
+        if ($this->cache === null) {
+            return $this->readFileVariables($strict);
+        }
 
+        $key    = self::cacheKeyForEnvironment($this->environment);
+        $cached = $this->cache->get($key);
+
+        if ($cached instanceof Variables) {
+            return $cached;
+        }
+
+        if (is_array($cached)) {
+            return Variables::fromArray($cached, $this->prefix);
+        }
+
+        $variables = $this->readFileVariables($strict);
+        $this->cache->set($key, $variables, $this->cacheTtl);
+
+        return $variables;
+    }
+
+    private function readFileVariables(bool $strict): Variables
+    {
+        return $this->reader->read(
+            environment: $this->environment,
+            prefix: $this->prefix,
+            strict: $strict,
+            interpolateGlobals: $this->includeGlobals,
+        );
+    }
 }

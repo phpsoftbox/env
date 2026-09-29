@@ -6,66 +6,78 @@ namespace PhpSoftBox\Env\Reader;
 
 use FilesystemIterator;
 use InvalidArgumentException;
+use PhpSoftBox\Env\EnvGlobals;
 use PhpSoftBox\Env\EnvironmentDetector;
 use PhpSoftBox\Env\Exception\EnvException;
 use PhpSoftBox\Env\Parser\ParserInterface;
 use PhpSoftBox\Env\Variables;
+use RecursiveCallbackFilterIterator;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
+use SplFileInfo;
 
-use function array_key_exists;
 use function array_merge;
 use function array_unique;
 use function array_values;
 use function basename;
-use function is_array;
+use function in_array;
 use function is_dir;
 use function is_file;
 use function is_readable;
-use function is_scalar;
 use function is_string;
 use function realpath;
 use function rtrim;
 use function sort;
 use function str_starts_with;
 
+/**
+ * Читает .env-файлы из заданных путей.
+ *
+ * Для каталога читаются только `.env` и `.env.{env}` в нём самом; обход подкаталогов включается явно
+ * ($recursive = true) и пропускает скрытые каталоги, vendor и node_modules.
+ * Путь к файлу читается как есть.
+ */
 final class FileReader implements ReaderInterface
 {
+    /**
+     * Каталоги, которые не обходятся в рекурсивном режиме (помимо скрытых).
+     */
+    private const array SKIPPED_DIRECTORIES = ['vendor', 'node_modules'];
+
     /**
      * @var list<string>
      */
     private array $paths;
 
+    /**
+     * @param list<string> $paths
+     */
     public function __construct(
         array $paths,
         private readonly ParserInterface $parser,
+        private readonly bool $recursive = false,
     ) {
         $this->paths = $this->normalizePaths($paths);
     }
 
     public function files(?string $environment = null): array
     {
-        $environment = $environment ?? EnvironmentDetector::detect();
-
-        return $this->resolveFiles($environment);
+        return $this->resolveFiles($this->resolveEnvironment($environment, EnvGlobals::all()));
     }
 
     public function read(
         ?string $environment = null,
-        bool $includeGlobals = true,
-        bool $overload = false,
         ?string $prefix = null,
         bool $strict = true,
+        bool $interpolateGlobals = true,
     ): Variables {
-        $environment = $environment ?? EnvironmentDetector::detect();
+        $context     = $interpolateGlobals ? EnvGlobals::all() : [];
+        $environment = $this->resolveEnvironment($environment, $context);
         $files       = $this->resolveFiles($environment);
 
         if ($files === [] && $strict) {
             throw new EnvException('No .env files found for provided paths.');
         }
-
-        $globals = $includeGlobals ? $this->readGlobals() : [];
-        $context = $globals;
 
         $fileValues = [];
         $exportable = [];
@@ -77,43 +89,60 @@ final class FileReader implements ReaderInterface
             $context    = array_merge($context, $parsed->values);
         }
 
-        if ($includeGlobals) {
-            if ($overload) {
-                $fileValues = array_merge($globals, $fileValues);
-            } else {
-                $fileValues = array_merge($fileValues, $globals);
-            }
-        }
-
         return Variables::fromParsed($fileValues, $exportable, $prefix, true);
     }
 
     /**
-     * @return array<string, string>
+     * Окружение: явно заданное, затем APP_ENV процесса, затем APP_ENV из базовых файлов (.env), иначе dev.
+     *
+     * @param array<string, string> $context
      */
-    private function readGlobals(): array
+    private function resolveEnvironment(?string $environment, array $context): string
     {
-        $data = [];
+        if ($environment !== null && $environment !== '') {
+            return $environment;
+        }
 
-        $env = $GLOBALS['_ENV'] ?? null;
-        if (is_array($env)) {
-            foreach ($env as $key => $value) {
-                if (is_string($key) && is_scalar($value)) {
-                    $data[$key] = (string) $value;
+        $detected = EnvironmentDetector::fromProcess();
+        if ($detected !== null) {
+            return $detected;
+        }
+
+        $values = [];
+        foreach ($this->resolveBaseFiles() as $path) {
+            $parsed  = $this->parser->parse($path, $context);
+            $values  = array_merge($values, $parsed->values);
+            $context = array_merge($context, $parsed->values);
+        }
+
+        $fromFiles = $values['APP_ENV'] ?? '';
+
+        return $fromFiles !== '' ? $fromFiles : EnvironmentDetector::DEFAULT_ENVIRONMENT;
+    }
+
+    /**
+     * Файлы, не зависящие от окружения: `.env` каталогов и явно указанные файлы.
+     *
+     * @return list<string>
+     */
+    private function resolveBaseFiles(): array
+    {
+        $files = [];
+
+        foreach ($this->paths as $path) {
+            if (!is_dir($path)) {
+                $files[] = $this->assertEnvFile($path);
+                continue;
+            }
+
+            foreach ($this->directories($path) as $dir) {
+                if (is_file($dir . '/.env')) {
+                    $files[] = $this->assertEnvFile($dir . '/.env', $path);
                 }
             }
         }
 
-        $server = $GLOBALS['_SERVER'] ?? null;
-        if (is_array($server)) {
-            foreach ($server as $key => $value) {
-                if (is_string($key) && is_scalar($value) && !array_key_exists($key, $data)) {
-                    $data[$key] = (string) $value;
-                }
-            }
-        }
-
-        return $data;
+        return array_values(array_unique($files));
     }
 
     /**
@@ -132,9 +161,7 @@ final class FileReader implements ReaderInterface
             $files[] = $this->assertEnvFile($path);
         }
 
-        $files = array_values(array_unique($files));
-
-        return $files;
+        return array_values(array_unique($files));
     }
 
     /**
@@ -142,23 +169,8 @@ final class FileReader implements ReaderInterface
      */
     private function resolveDirectoryFiles(string $root, string $environment): array
     {
-        $directories = [$root];
-        $iterator    = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
-            RecursiveIteratorIterator::SELF_FIRST,
-        );
-
-        foreach ($iterator as $info) {
-            if ($info->isDir()) {
-                $directories[] = $info->getPathname();
-            }
-        }
-
-        $directories = array_values(array_unique($directories));
-        sort($directories);
-
         $files = [];
-        foreach ($directories as $dir) {
+        foreach ($this->directories($root) as $dir) {
             $base = $dir . '/.env';
             if (is_file($base)) {
                 $files[] = $this->assertEnvFile($base, $root);
@@ -171,6 +183,37 @@ final class FileReader implements ReaderInterface
         }
 
         return $files;
+    }
+
+    /**
+     * Каталоги для поиска файлов: сам каталог, а в рекурсивном режиме — ещё и вложенные (корень первым).
+     *
+     * @return list<string>
+     */
+    private function directories(string $root): array
+    {
+        if (!$this->recursive) {
+            return [$root];
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveCallbackFilterIterator(
+                new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+                static fn (SplFileInfo $info): bool => $info->isDir()
+                    && !str_starts_with($info->getFilename(), '.')
+                    && !in_array($info->getFilename(), self::SKIPPED_DIRECTORIES, true),
+            ),
+            RecursiveIteratorIterator::SELF_FIRST,
+        );
+
+        $directories = [];
+        foreach ($iterator as $info) {
+            $directories[] = $info->getPathname();
+        }
+
+        sort($directories);
+
+        return [$root, ...$directories];
     }
 
     private function assertEnvFile(string $path, ?string $root = null): string
